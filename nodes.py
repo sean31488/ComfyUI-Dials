@@ -43,6 +43,7 @@ NUISANCE_SUBJECTS = "A woman\nA man\nA dog\nAn old car"
 DIAL_SUBDIR = "dials"
 INJECT = ["post_refiner (hook)", "pre_refiner (LoRA file)"]
 KEY_SUFFIX = {"pre": "diff_b", "post": "dials_shift"}  # file key: diffusion_model.<target>.<suffix>
+MAX_DIALS = 10
 
 Dial = io.Custom("DIAL")
 
@@ -107,6 +108,33 @@ def save_dial(dial, name):
     key = f"diffusion_model.{dial['target']}.{KEY_SUFFIX[dial['mode']]}"
     save_file({key: dial["vec"].to(torch.bfloat16).contiguous()}, path, metadata=meta)
     return path
+
+
+def load_dial(dial_name):
+    path = folder_paths.get_full_path_or_raise("loras", dial_name)  # resolves inside the loras folders only
+    with safe_open(path, "pt") as f:
+        keys = list(f.keys())
+        if len(keys) != 1 or not keys[0].startswith("diffusion_model."):
+            raise ValueError(f"{dial_name} is not a dial file (expected one diffusion_model.<layer>.<diff_b|dials_shift> key)")
+        vec = f.get_tensor(keys[0]).float()
+        meta = dict(f.metadata() or {})
+    target, suffix = keys[0][len("diffusion_model."):].rsplit(".", 1)
+    mode = {v: k for k, v in KEY_SUFFIX.items()}.get(suffix)
+    if mode is None:
+        raise ValueError(f"{dial_name}: unknown dial key suffix '{suffix}'")
+    return {"vec": vec, "target": target, "mode": mode, "meta": meta}
+
+
+def dial_files():
+    return [f for f in folder_paths.get_filename_list("loras") if f.replace("\\", "/").startswith(f"{DIAL_SUBDIR}/")]
+
+
+def patch_dial(m, dial, strength):
+    if dial["mode"] == "pre":
+        m.add_patches({f"diffusion_model.{dial['target']}.bias": ("diff", (dial["vec"],))}, strength)
+    else:
+        name = f"diffusion_model.{dial['target']}.forward"
+        m.add_object_patch(name, ShiftedForward(m.get_model_object(name), dial["vec"] * strength))
 
 
 def dial_report(dial):
@@ -222,40 +250,64 @@ class ApplyDial(io.ComfyNode):
         if strength == 0:
             return io.NodeOutput(model)
         m = model.clone()
-        if dial["mode"] == "pre":
-            m.add_patches({f"diffusion_model.{dial['target']}.bias": ("diff", (dial["vec"],))}, strength)
-        else:
-            name = f"diffusion_model.{dial['target']}.forward"
-            m.add_object_patch(name, ShiftedForward(m.get_model_object(name), dial["vec"] * strength))
+        patch_dial(m, dial, strength)
+        return io.NodeOutput(m)
+
+
+class ApplyDials(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        files = ["None"] + dial_files()
+        options = []
+        for n in range(1, MAX_DIALS + 1):
+            inputs = []
+            for i in range(1, n + 1):
+                inputs += [
+                    io.Boolean.Input(f"enabled_{i}", default=True),
+                    io.Combo.Input(f"dial_{i}", options=files, default="None"),
+                    io.Float.Input(f"strength_{i}", default=1.0, min=-20.0, max=20.0, step=0.05,
+                                   tooltip="Negative = toward A, positive = toward B."),
+                ]
+            options.append(io.DynamicCombo.Option(str(n), inputs))
+        return io.Schema(
+            node_id="DialsApplyDials",
+            display_name="Apply Dials",
+            category="Dials",
+            description="Load and apply several saved dials in order, each with its own switch and strength.",
+            inputs=[
+                io.Model.Input("model"),
+                io.DynamicCombo.Input("num_dials", options=options, display_name="Number of Dials"),
+            ],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, num_dials) -> io.NodeOutput:
+        m = model
+        for i in range(1, int(num_dials["num_dials"]) + 1):
+            name, strength = num_dials[f"dial_{i}"], num_dials[f"strength_{i}"]
+            if not num_dials[f"enabled_{i}"] or name == "None" or strength == 0:
+                continue
+            if m is model:
+                m = model.clone()
+            patch_dial(m, load_dial(name), strength)
         return io.NodeOutput(m)
 
 
 class LoadDial(io.ComfyNode):
     @classmethod
     def define_schema(cls):
-        files = [f for f in folder_paths.get_filename_list("loras") if f.replace("\\", "/").startswith(f"{DIAL_SUBDIR}/")]
         return io.Schema(
             node_id="DialsLoadDial",
             display_name="Load Dial",
             category="Dials",
-            inputs=[io.Combo.Input("dial_name", options=files)],
+            inputs=[io.Combo.Input("dial_name", options=dial_files())],
             outputs=[Dial.Output(display_name="dial"), io.String.Output(display_name="report")],
         )
 
     @classmethod
     def execute(cls, dial_name) -> io.NodeOutput:
-        path = folder_paths.get_full_path_or_raise("loras", dial_name)  # resolves inside the loras folders only
-        with safe_open(path, "pt") as f:
-            keys = list(f.keys())
-            if len(keys) != 1 or not keys[0].startswith("diffusion_model."):
-                raise ValueError(f"{dial_name} is not a dial file (expected one diffusion_model.<layer>.<diff_b|dials_shift> key)")
-            vec = f.get_tensor(keys[0]).float()
-            meta = dict(f.metadata() or {})
-        target, suffix = keys[0][len("diffusion_model."):].rsplit(".", 1)
-        mode = {v: k for k, v in KEY_SUFFIX.items()}.get(suffix)
-        if mode is None:
-            raise ValueError(f"{dial_name}: unknown dial key suffix '{suffix}'")
-        dial = {"vec": vec, "target": target, "mode": mode, "meta": meta}
+        dial = load_dial(dial_name)
         return io.NodeOutput(dial, dial_report(dial))
 
 
@@ -311,7 +363,7 @@ class SaveDial(io.ComfyNode):
 
 class DialsExtension(ComfyExtension):
     async def get_node_list(self):
-        return [MakeDial, ApplyDial, LoadDial, CombineDials, SaveDial]
+        return [MakeDial, ApplyDial, ApplyDials, LoadDial, CombineDials, SaveDial]
 
 
 async def comfy_entrypoint() -> DialsExtension:
